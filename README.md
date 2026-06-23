@@ -31,11 +31,13 @@ or to ship a pre-warmed cache.
 
 ## How it works
 
-### Running the server in a namespace (`HORAPHA_NS=1`)
+### Running the server in a namespace (default)
 
-Setting `HORAPHA_NS=1` makes `horapha` re-execute itself into fresh **user + PID
-+ mount** namespaces (no root, no setuid helpers) and become **PID 1 running a
-small init** (`internal/nsrun/init.go`), which then forks bazel. The init:
+By default (whenever an explicit `--output_base` is given), `horapha`
+re-executes itself into fresh **user + PID + mount** namespaces (no root, no
+setuid helpers) and becomes **PID 1 running a small init**
+(`internal/nsrun/init.go`), which then forks bazel. Set `HORAPHA_NO_NS=1` to
+disable this and forward to bazel verbatim. The init:
 
 1. mounts a private `/proc` so tools and CRIU see the namespaced process view;
 2. forks bazel as the foreground command, forwards signals, and reaps orphans —
@@ -63,9 +65,14 @@ inside the namespace, driven by the init**:
 
 - `horapha checkpoint` connects to the control socket and asks the init to run
   `criu dump --leave-running`. The checkpointed namespace-local pid is recorded
-  in `criu/ns-pid`.
+  in `criu/ns-pid`. Pass `--stop` to dump and then tear the server down
+  (`horapha checkpoint --stop --output_base=…`), e.g. to free resources or to
+  test restore.
 - `horapha restore` launches `criu restore` as the foreground command of a fresh
   namespace; the init adopts the restored server and persists.
+- **Auto-restore:** an ordinary `horapha` command (e.g. `build`) with no running
+  server but an existing `criu/` checkpoint restores it automatically before
+  forwarding, so you transparently land on your warm server.
 
 CRIU is run with `--unprivileged`, `--tcp-close` (clients reconnect),
 `--ghost-limit`, and `--skip-file-rwx-check`. We keep the **host network
@@ -109,7 +116,7 @@ libraries stay file-backed and CRIU dumps them normally.
 |-------------------|--------------------------------------------------------|
 | `HORAPHA_BAZEL`   | bazel binary to wrap (default: bazelisk/bazel)         |
 | `HORAPHA_CRIU`    | criu binary to use (default: `criu`)                   |
-| `HORAPHA_NS`      | run bazel under an init in user+PID+mount namespaces   |
+| `HORAPHA_NO_NS`   | disable namespace mode; forward to bazel verbatim      |
 | `HORAPHA_JNI_DIR` | set automatically: where the patched bazel keeps JNI libs |
 | `HORAPHA_DEBUG`   | mirror CRIU logs to stderr                             |
 
@@ -153,16 +160,17 @@ Then point horapha at it:
 ```sh
 export HORAPHA_BAZEL=~/bin/bazel-horapha
 
-# start a checkpointable server in a namespace
-HORAPHA_NS=1 horapha --output_base=/tmp/ob build //...
+# namespace mode is the default; this starts a checkpointable server
+horapha --output_base=/tmp/ob build //...
 
-# snapshot it
+# snapshot it (the server keeps running; add --stop to tear it down too)
 horapha checkpoint --output_base=/tmp/ob
 
 # ...later (even after the processes are gone), bring it back
 horapha restore --output_base=/tmp/ob
 
-# ordinary clients attach to the (restored) warm server transparently
+# ordinary clients attach to the warm server transparently — and if the
+# server is gone but a checkpoint exists, this auto-restores it first
 horapha --output_base=/tmp/ob build //...
 ```
 
@@ -173,8 +181,8 @@ startup fingerprint and attach instead of starting their own.
 
 ## Status
 
-This is a research experiment. The full cycle works end-to-end: a warm server
-started with `HORAPHA_NS=1` can be checkpointed, the machine state thrown away,
-restored, and a stock bazel client reattaches to the revived server. Rough edges
-remain (a client must pass the same startup flags horapha injects; multi-server
-and cleanup edge cases are not hardened).
+This is a research experiment. The full cycle works end-to-end: a warm
+namespaced server can be checkpointed, the machine state thrown away, restored
+(automatically, on the next command), and a stock bazel client reattaches to the
+revived server. Rough edges remain (multi-server and cleanup edge cases are not
+hardened).

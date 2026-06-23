@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/engflow/horapha/internal/control"
 	"github.com/engflow/horapha/internal/criu"
@@ -66,11 +67,24 @@ func handleControlConn(ctx context.Context, conn net.Conn, outputBase string) {
 	case control.CmdPing:
 		_, _ = conn.Write([]byte(control.FormatOK("pong")))
 	case control.CmdCheckpoint:
-		if err := doCheckpoint(ctx, outputBase); err != nil {
+		if err := doCheckpoint(ctx, outputBase, true); err != nil {
 			_, _ = conn.Write([]byte(control.FormatErr(err.Error())))
 			return
 		}
 		_, _ = conn.Write([]byte(control.FormatOK("checkpointed")))
+	case control.CmdCheckpointStop:
+		// Dump with the server left running so we can reply over the socket
+		// first; criu killing the tree (and with it PID 1) would otherwise race
+		// the response and the client would see a dropped connection.
+		if err := doCheckpoint(ctx, outputBase, true); err != nil {
+			_, _ = conn.Write([]byte(control.FormatErr(err.Error())))
+			return
+		}
+		_, _ = conn.Write([]byte(control.FormatOK("checkpointed and stopped")))
+		_ = conn.Close()
+		// Now tear down the namespace: kill everything except PID 1 (us); the
+		// reaper then drains the empty namespace and init exits.
+		_ = syscall.Kill(-1, syscall.SIGKILL)
 	default:
 		_, _ = conn.Write([]byte(control.FormatErr("unknown command: " + cmd)))
 	}
@@ -93,9 +107,10 @@ func logControl(outputBase, format string, args ...any) {
 }
 
 // doCheckpoint runs criu dump against the bazel server, from inside the
-// namespace. We dump by the server's namespace-local pid (read from
-// server.pid.txt) and --leave-running so the server keeps serving.
-func doCheckpoint(ctx context.Context, outputBase string) error {
+// namespace, by the server's namespace-local pid (read from server.pid.txt).
+// When leaveRunning is true the server keeps serving after the dump; when false
+// criu kills the dumped tree, so the namespace's init drains and exits.
+func doCheckpoint(ctx context.Context, outputBase string, leaveRunning bool) error {
 	pidBytes, err := os.ReadFile(filepath.Join(outputBase, "server", "server.pid.txt"))
 	if err != nil {
 		return fmt.Errorf("read server pid: %w", err)
@@ -110,7 +125,7 @@ func doCheckpoint(ctx context.Context, outputBase string) error {
 		ImagesDir:    imagesDir,
 		ShellJob:     true,
 		TCPClose:     true,
-		LeaveRunning: true,
+		LeaveRunning: leaveRunning,
 		Unprivileged: true,
 	})
 	if err != nil {

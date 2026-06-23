@@ -26,14 +26,25 @@ import (
 // imagesSubdir is where checkpoint images live, relative to output_base.
 const imagesSubdir = "criu"
 
+// Exists reports whether a usable checkpoint is present for output_base, i.e.
+// the images dir contains the recorded namespace pid that Restore needs.
+func Exists(outputBase string) bool {
+	_, err := os.Stat(filepath.Join(outputBase, imagesSubdir, serverinfo.CheckpointPIDName))
+	return err == nil
+}
+
 // Checkpoint asks the in-namespace init (over its control socket) to dump the
 // bazel server into $output_base/criu/.
 //
 // criu must run inside the namespace because CAP_CHECKPOINT_RESTORE is only
 // held there and the host cannot re-enter the namespace; the init is our agent
 // inside it. See internal/control.
-func Checkpoint(ctx context.Context, startupArgs []string) error {
-	startup := bazel.StartupFlags(startupArgs)
+func Checkpoint(ctx context.Context, args []string) error {
+	// --stop is a horapha flag (not bazel's): after dumping, stop the server
+	// and tear down its namespace. Strip it before resolving startup flags.
+	stop, args := popFlag(args, "--stop")
+
+	startup := bazel.StartupFlags(args)
 
 	// Resolve output_base WITHOUT running bazel. `bazel info` would fail to
 	// attach to the namespaced server (its rawproto still advertises the
@@ -46,18 +57,36 @@ func Checkpoint(ctx context.Context, startupArgs []string) error {
 		return fmt.Errorf("checkpoint requires an explicit --output_base startup flag")
 	}
 
-	dir := filepath.Join(outputBase, imagesSubdir)
-	fmt.Fprintf(os.Stderr, "horapha: requesting checkpoint -> %s\n", dir)
+	cmd := control.CmdCheckpoint
+	action := "checkpoint"
+	if stop {
+		cmd = control.CmdCheckpointStop
+		action = "checkpoint+stop"
+	}
 
-	resp, err := control.Request(outputBase, control.CmdCheckpoint, 5*time.Minute)
+	dir := filepath.Join(outputBase, imagesSubdir)
+	fmt.Fprintf(os.Stderr, "horapha: requesting %s -> %s\n", action, dir)
+
+	resp, err := control.Request(outputBase, cmd, 5*time.Minute)
 	if err != nil {
 		return err
 	}
 	if !resp.OK {
-		return fmt.Errorf("checkpoint failed: %s", resp.Message)
+		return fmt.Errorf("%s failed: %s", action, resp.Message)
 	}
 	fmt.Fprintf(os.Stderr, "horapha: %s\n", resp.Message)
 	return nil
+}
+
+// popFlag removes the first occurrence of flag from args, reporting whether it
+// was present.
+func popFlag(args []string, flag string) (bool, []string) {
+	for i, a := range args {
+		if a == flag {
+			return true, append(args[:i:i], args[i+1:]...)
+		}
+	}
+	return false, args
 }
 
 // Restore brings the bazel server back from $output_base/criu/ and rewrites the

@@ -30,8 +30,12 @@ const SockName = "horapha.sock"
 // Commands (request is a single line; response is "OK[ message]" or "ERR
 // message").
 const (
-	CmdPing       = "PING"
+	CmdPing = "PING"
+	// CmdCheckpoint dumps the server and leaves it running.
 	CmdCheckpoint = "CHECKPOINT"
+	// CmdCheckpointStop dumps the server and then stops it (criu kills the
+	// dumped tree), so the namespace and its init tear down afterwards.
+	CmdCheckpointStop = "CHECKPOINT_STOP"
 )
 
 // SockPath returns the control socket path for an output_base.

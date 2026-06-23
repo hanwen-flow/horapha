@@ -65,15 +65,31 @@ func run(args []string) int {
 		}
 		args = bazel.WithCheckpointableFlags(args)
 
-		// When HORAPHA_NS is set we run bazel inside a fresh PID namespace under
-		// an init, so the server tree has reproducible PIDs for rootless CRIU.
-		// But only START a namespaced server if one is not already running:
-		// otherwise re-running `HORAPHA_NS=1 horapha ...` would spawn a fresh
-		// namespace every time (its client cannot see the existing server's
-		// host pid in its own /proc) and never reuse the warm server. If an
-		// init is already serving the control socket, fall through to a plain
-		// host client, which attaches over loopback via the rewritten rawproto.
-		if os.Getenv("HORAPHA_NS") != "" && !namespacedServerRunning(ob) {
+		// Auto-restore: if no namespaced server is running but a checkpoint
+		// exists, bring the warm server back before forwarding the command, so
+		// the user transparently reattaches to their saved server instead of
+		// cold-starting a new one. Best-effort — on failure we fall through to
+		// a normal (cold) bazel invocation.
+		if ob != "" && !namespacedServerRunning(ob) && checkpoint.Exists(ob) {
+			fmt.Fprintf(os.Stderr, "horapha: no server running; restoring checkpoint\n")
+			if err := checkpoint.Restore(ctx, []string{"--output_base=" + ob}); err != nil {
+				fmt.Fprintf(os.Stderr, "horapha: auto-restore failed (%v); starting fresh\n", err)
+			}
+		}
+
+		// By default horapha runs bazel inside a fresh PID namespace under an
+		// init, so the server tree has reproducible PIDs for rootless CRIU —
+		// that is the whole point of the wrapper. We only do this when an
+		// explicit --output_base is given (we need a known location for the
+		// control socket / JNI dir; without it we cannot manage the server) and
+		// when no namespaced server is already running. Set HORAPHA_NO_NS=1 to
+		// opt out and forward to bazel verbatim.
+		//
+		// If a namespaced server is already up, fall through to a plain host
+		// client, which attaches over loopback via the rewritten rawproto;
+		// re-entering would otherwise spawn a fresh namespace each time (its
+		// client cannot see the existing server's host pid in its own /proc).
+		if os.Getenv("HORAPHA_NO_NS") == "" && ob != "" && !namespacedServerRunning(ob) {
 			argv := append([]string{bazel.Binary()}, args...)
 			err := nsrun.Run(ctx, ob, argv)
 			// The server now runs in the namespace and has written its
@@ -82,9 +98,7 @@ func run(args []string) int {
 			// host clients can attach over loopback — without this they would
 			// fail verification and start a competing server. Best-effort: a
 			// failure here only costs the transparent-reattach optimization.
-			if ob != "" {
-				makeServerReachable(ob)
-			}
+			makeServerReachable(ob)
 			return toExit(err)
 		}
 		return toExit(bazel.Passthrough(ctx, args))
