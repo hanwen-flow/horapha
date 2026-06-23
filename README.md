@@ -115,9 +115,61 @@ libraries stay file-backed and CRIU dumps them normally.
 
 ## Build
 
+Build `horapha` itself:
+
 ```
 go build -o horapha .
 ```
+
+### Building the patched bazel
+
+horapha requires a bazel built with the `JniLoader` patch (see "Required bazel
+patch" above). Build the patched binary from a bazel checkout that carries the
+patch:
+
+```
+cd /path/to/bazel
+bazel build //src:bazel-dev
+# → bazel-bin/src/bazel-dev
+```
+
+The `bazel-dev` binary is compiled for a recent JDK (e.g. Java 21), but the
+server defaults to bazel's embedded JDK (often 11), which fails with
+`UnsupportedClassVersionError`. Run the server on a matching JDK with
+`--server_javabase`. The simplest way to apply both that flag and the patched
+binary is a small wrapper that `HORAPHA_BAZEL` points at:
+
+```sh
+cat > ~/bin/bazel-horapha <<'EOF'
+#!/bin/bash
+exec /path/to/bazel/bazel-bin/src/bazel-dev \
+  --server_javabase=/usr/lib/jvm/java-21-openjdk-amd64 "$@"
+EOF
+chmod +x ~/bin/bazel-horapha
+```
+
+Then point horapha at it:
+
+```sh
+export HORAPHA_BAZEL=~/bin/bazel-horapha
+
+# start a checkpointable server in a namespace
+HORAPHA_NS=1 horapha --output_base=/tmp/ob build //...
+
+# snapshot it
+horapha checkpoint --output_base=/tmp/ob
+
+# ...later (even after the processes are gone), bring it back
+horapha restore --output_base=/tmp/ob
+
+# ordinary clients attach to the (restored) warm server transparently
+horapha --output_base=/tmp/ob build //...
+```
+
+`--output_base` is required for `checkpoint`/`restore` (horapha must not run
+`bazel info`, which would start a competing server). horapha injects the JNI
+flags automatically on every invocation, so plain clients share the server's
+startup fingerprint and attach instead of starting their own.
 
 ## Status
 
