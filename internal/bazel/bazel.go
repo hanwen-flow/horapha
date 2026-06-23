@@ -90,17 +90,33 @@ func StartupFlags(args []string) []string {
 // was present. Unlike OutputBase it never launches bazel, which matters for
 // restore: running `bazel info` there would start a fresh host server and
 // clobber the checkpoint we are about to restore.
+//
+// The value is tilde- and env-expanded to match the path bazel itself uses:
+// the shell does not expand "~" in a "--output_base=~/x" argument, but bazel
+// does, so horapha must too — otherwise it looks for server files under a
+// literal "~" directory.
 func ExplicitOutputBase(startupFlags []string) (string, bool) {
 	const key = "--output_base"
 	for i, a := range startupFlags {
 		if v, ok := strings.CutPrefix(a, key+"="); ok {
-			return v, true
+			return expandPath(v), true
 		}
 		if a == key && i+1 < len(startupFlags) {
-			return startupFlags[i+1], true
+			return expandPath(startupFlags[i+1]), true
 		}
 	}
 	return "", false
+}
+
+// expandPath resolves a leading "~" or "~/" to the user's home directory, the
+// way bazel expands output_base paths.
+func expandPath(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home + strings.TrimPrefix(p, "~")
+		}
+	}
+	return p
 }
 
 // ServerPID reads the bazel server pid from $output_base/server/server.pid.txt.

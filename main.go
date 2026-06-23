@@ -23,6 +23,7 @@ import (
 
 	"github.com/engflow/horapha/internal/bazel"
 	"github.com/engflow/horapha/internal/checkpoint"
+	"github.com/engflow/horapha/internal/control"
 	"github.com/engflow/horapha/internal/nsrun"
 	"github.com/engflow/horapha/internal/serverinfo"
 )
@@ -66,7 +67,13 @@ func run(args []string) int {
 
 		// When HORAPHA_NS is set we run bazel inside a fresh PID namespace under
 		// an init, so the server tree has reproducible PIDs for rootless CRIU.
-		if os.Getenv("HORAPHA_NS") != "" {
+		// But only START a namespaced server if one is not already running:
+		// otherwise re-running `HORAPHA_NS=1 horapha ...` would spawn a fresh
+		// namespace every time (its client cannot see the existing server's
+		// host pid in its own /proc) and never reuse the warm server. If an
+		// init is already serving the control socket, fall through to a plain
+		// host client, which attaches over loopback via the rewritten rawproto.
+		if os.Getenv("HORAPHA_NS") != "" && !namespacedServerRunning(ob) {
 			argv := append([]string{bazel.Binary()}, args...)
 			err := nsrun.Run(ctx, ob, argv)
 			// The server now runs in the namespace and has written its
@@ -89,6 +96,17 @@ func firstArg(args []string) string {
 		return ""
 	}
 	return args[0]
+}
+
+// namespacedServerRunning reports whether an in-namespace init is already
+// serving the checkpoint control socket for this output_base, i.e. a warm
+// namespaced server already exists and we should attach rather than start one.
+func namespacedServerRunning(outputBase string) bool {
+	if outputBase == "" {
+		return false
+	}
+	resp, err := control.Request(outputBase, control.CmdPing, 2*time.Second)
+	return err == nil && resp.OK
 }
 
 // makeServerReachable rewrites the namespaced server's identity files so a
