@@ -46,15 +46,12 @@ func Checkpoint(ctx context.Context, args []string) error {
 
 	startup := bazel.StartupFlags(args)
 
-	// Resolve output_base WITHOUT running bazel. `bazel info` would fail to
-	// attach to the namespaced server (its rawproto still advertises the
-	// namespace-local pid) and start a *competing* host server, which
-	// overwrites server.pid.txt and trips the namespaced server's
-	// PidFileWatcher into halting. So checkpoint requires explicit
-	// --output_base, same as restore.
-	outputBase, ok := bazel.ExplicitOutputBase(startup)
+	// Resolve output_base the way bazel does (explicit flag, else derived from
+	// the workspace + output_user_root) WITHOUT running bazel — running
+	// `bazel info` would start a competing server.
+	outputBase, ok := bazel.ResolveOutputBase(startup)
 	if !ok {
-		return fmt.Errorf("checkpoint requires an explicit --output_base startup flag")
+		return fmt.Errorf("checkpoint: no workspace found and no --output_base given; run inside a bazel workspace or pass --output_base")
 	}
 
 	cmd := control.CmdCheckpoint
@@ -94,12 +91,12 @@ func popFlag(args []string, flag string) (bool, []string) {
 func Restore(ctx context.Context, startupArgs []string) error {
 	startup := bazel.StartupFlags(startupArgs)
 
-	// Resolve output_base WITHOUT running bazel: `bazel info` would start a
-	// fresh host server and clobber the checkpoint we are about to restore. We
-	// therefore require an explicit --output_base for restore.
-	outputBase, ok := bazel.ExplicitOutputBase(startup)
+	// Resolve output_base the way bazel does (explicit flag, else derived from
+	// the workspace + output_user_root) WITHOUT running bazel — running it
+	// would start a fresh server and clobber the checkpoint we are restoring.
+	outputBase, ok := bazel.ResolveOutputBase(startup)
 	if !ok {
-		return fmt.Errorf("restore requires an explicit --output_base startup flag")
+		return fmt.Errorf("restore: no workspace found and no --output_base given; run inside a bazel workspace or pass --output_base")
 	}
 
 	dir := filepath.Join(outputBase, imagesSubdir)

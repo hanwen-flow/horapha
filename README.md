@@ -33,7 +33,7 @@ or to ship a pre-warmed cache.
 
 ### Running the server in a namespace (default)
 
-By default (whenever an explicit `--output_base` is given), `horapha`
+By default (whenever an `output_base` can be resolved — see below), `horapha`
 re-executes itself into fresh **user + PID + mount** namespaces (no root, no
 setuid helpers) and becomes **PID 1 running a small init**
 (`internal/nsrun/init.go`), which then forks bazel. Set `HORAPHA_NO_NS=1` to
@@ -55,8 +55,24 @@ loopback (see below).
 ### Checkpoint / restore
 
 `checkpoint`/`restore` take the same bazel *startup* flags as a normal
-invocation; `--output_base` is **required** (we must not run `bazel info`, which
-would start a competing server). Images live under `$output_base/criu/`.
+invocation. Images live under `$output_base/criu/`.
+
+### Resolving the output_base
+
+horapha replicates bazel's own algorithm to find the `output_base`, so you
+rarely need to pass `--output_base`:
+
+- an explicit `--output_base` startup flag wins (with `~` expanded);
+- otherwise it is `<output_user_root>/<md5(workspace_root)>`, where the
+  workspace root is the nearest ancestor of the cwd containing a
+  `MODULE.bazel`/`REPO.bazel`/`WORKSPACE.bazel`/`WORKSPACE` file, and
+  `output_user_root` defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/bazel/_bazel_$USER`
+  (or an explicit `--output_user_root`).
+
+This matches `bazel info output_base` exactly. horapha never runs `bazel info`
+to discover it (that would start a competing server); it computes the path
+itself. If you are not inside a workspace and give no `--output_base`, horapha
+cannot resolve one — but neither could bazel — and just forwards verbatim.
 
 CRIU needs `CAP_CHECKPOINT_RESTORE`, which is only held *inside* the user
 namespace — and an unprivileged host process cannot re-enter a PID namespace
@@ -66,8 +82,7 @@ inside the namespace, driven by the init**:
 - `horapha checkpoint` connects to the control socket and asks the init to run
   `criu dump --leave-running`. The checkpointed namespace-local pid is recorded
   in `criu/ns-pid`. Pass `--stop` to dump and then tear the server down
-  (`horapha checkpoint --stop --output_base=…`), e.g. to free resources or to
-  test restore.
+  (`horapha checkpoint --stop`), e.g. to free resources or to test restore.
 - `horapha restore` launches `criu restore` as the foreground command of a fresh
   namespace; the init adopts the restored server and persists.
 - **Auto-restore:** an ordinary `horapha` command (e.g. `build`) with no running
@@ -159,25 +174,27 @@ Then point horapha at it:
 
 ```sh
 export HORAPHA_BAZEL=~/bin/bazel-horapha
+cd ~/my/workspace        # a dir under a MODULE.bazel / WORKSPACE
 
-# namespace mode is the default; this starts a checkpointable server
-horapha --output_base=/tmp/ob build //...
+# namespace mode is the default; this starts a checkpointable server.
+# output_base is derived like bazel does, so no --output_base needed.
+horapha build //...
 
 # snapshot it (the server keeps running; add --stop to tear it down too)
-horapha checkpoint --output_base=/tmp/ob
+horapha checkpoint
 
 # ...later (even after the processes are gone), bring it back
-horapha restore --output_base=/tmp/ob
+horapha restore
 
 # ordinary clients attach to the warm server transparently — and if the
 # server is gone but a checkpoint exists, this auto-restores it first
-horapha --output_base=/tmp/ob build //...
+horapha build //...
 ```
 
-`--output_base` is required for `checkpoint`/`restore` (horapha must not run
-`bazel info`, which would start a competing server). horapha injects the JNI
-flags automatically on every invocation, so plain clients share the server's
-startup fingerprint and attach instead of starting their own.
+horapha injects the JNI flags automatically on every invocation, so plain
+clients share the server's startup fingerprint and attach instead of starting
+their own. Pass `--output_base=…` (or run outside a workspace) to override the
+derived location.
 
 ## Status
 

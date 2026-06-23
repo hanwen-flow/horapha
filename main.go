@@ -59,7 +59,12 @@ func run(args []string) int {
 		// only the server-launching call carried these flags, ordinary
 		// `horapha build`/`info` clients would mismatch and force a restart.
 		// See internal/serverinfo and the JniLoader patch in the bazel tree.
-		ob, _ := bazel.ExplicitOutputBase(bazel.StartupFlags(args))
+		// Resolve output_base the way bazel itself would (explicit flag, else
+		// derived from the workspace root and output_user_root), so the user
+		// rarely needs --output_base. Empty only when there is no workspace and
+		// no explicit base — in which case bazel could not resolve one either,
+		// and we just forward verbatim.
+		ob, _ := bazel.ResolveOutputBase(bazel.StartupFlags(args))
 		if ob != "" {
 			os.Setenv(bazel.JNIDirEnv, filepath.Join(ob, "horapha-jni"))
 		}
