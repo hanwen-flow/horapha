@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 )
 
@@ -48,6 +49,26 @@ func Passthrough(ctx context.Context, args []string) error {
 	return wrapExit(cmd.Run())
 }
 
+// JNIDirEnv is read by the (patched) bazel server's JniLoader: when set, JNI
+// libraries are extracted to that directory and left on disk instead of being
+// unlinked, so rootless CRIU can dump their file-backed mappings.
+const JNIDirEnv = "HORAPHA_JNI_DIR"
+
+// nettyNoDeleteFlag stops Netty (used by bazel's gRPC stack) from deleting its
+// extracted native library after loading, for the same CRIU reason as
+// JNIDirEnv. It is a bazel startup flag (affects the server JVM).
+const nettyNoDeleteFlag = "--host_jvm_args=-Dio.netty.native.deleteLibAfterLoading=false"
+
+// WithCheckpointableFlags inserts the bazel startup flags required to make the
+// server checkpointable, ahead of the user's arguments, unless already present.
+// Startup flags must precede the bazel command, so they go at the front.
+func WithCheckpointableFlags(args []string) []string {
+	if slices.Contains(args, nettyNoDeleteFlag) {
+		return args // already present
+	}
+	return append([]string{nettyNoDeleteFlag}, args...)
+}
+
 // StartupFlags extracts the bazel *startup* flags from a horapha argument list.
 // Startup flags are those appearing before the bazel command (e.g. "build").
 // checkpoint/restore accept the same startup flags so they can locate the same
@@ -64,20 +85,22 @@ func StartupFlags(args []string) []string {
 	return flags
 }
 
-// OutputBase returns the output_base for the server identified by the given
-// startup flags, by asking bazel itself: `bazel <startup> info output_base`.
-//
-// This deliberately starts the server if it is not already running, which is
-// also what we want before a checkpoint.
-func OutputBase(ctx context.Context, startupFlags []string) (string, error) {
-	args := append(append([]string{}, startupFlags...), "info", "output_base")
-	cmd := exec.CommandContext(ctx, Binary(), args...)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("bazel info output_base: %w", err)
+// ExplicitOutputBase returns the value of an explicit --output_base startup
+// flag (in either "--output_base=X" or "--output_base X" form), and whether it
+// was present. Unlike OutputBase it never launches bazel, which matters for
+// restore: running `bazel info` there would start a fresh host server and
+// clobber the checkpoint we are about to restore.
+func ExplicitOutputBase(startupFlags []string) (string, bool) {
+	const key = "--output_base"
+	for i, a := range startupFlags {
+		if v, ok := strings.CutPrefix(a, key+"="); ok {
+			return v, true
+		}
+		if a == key && i+1 < len(startupFlags) {
+			return startupFlags[i+1], true
+		}
 	}
-	return strings.TrimSpace(string(out)), nil
+	return "", false
 }
 
 // ServerPID reads the bazel server pid from $output_base/server/server.pid.txt.

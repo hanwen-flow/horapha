@@ -17,7 +17,6 @@ package nsrun
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,10 +29,13 @@ import (
 // namespaced child. It is deliberately unlikely to collide with bazel.
 const ChildArg = "__horapha_ns_child__"
 
-// Run re-executes horapha inside new user+PID+mount namespaces and, in the
-// child, execs argv[0] with argv[1:]. Stdio is inherited. It returns when the
-// command exits.
-func Run(ctx context.Context, argv []string) error {
+// Run re-executes horapha inside new user+PID+mount namespaces. The re-exec'd
+// child becomes PID 1 and runs an init (see init.go) that forks argv as the
+// foreground command. Run returns the foreground command's exit code as soon as
+// it finishes, deliberately LEAVING the init (and any daemonized bazel server)
+// running in the background so the server — and its namespaces — persist for a
+// later checkpoint. The namespace lives exactly as long as that init does.
+func Run(ctx context.Context, outputBase string, argv []string) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("nsrun: empty argv")
 	}
@@ -42,11 +44,26 @@ func Run(ctx context.Context, argv []string) error {
 		return fmt.Errorf("nsrun: locate self: %w", err)
 	}
 
+	// Status pipe: init writes the foreground exit code, then we return.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("nsrun: pipe: %w", err)
+	}
+	defer pr.Close()
+
 	args := append([]string{ChildArg}, argv...)
-	cmd := exec.CommandContext(ctx, self, args...)
+	// Note: not CommandContext — we must NOT kill the child when Run returns;
+	// the init is meant to outlive us.
+	cmd := exec.Command(self, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.ExtraFiles = []*os.File{pw} // becomes fd 3 (statusFD) in the child
+	// Tell the init where output_base is, so it can serve the control socket.
+	cmd.Env = os.Environ()
+	if outputBase != "" {
+		cmd.Env = append(cmd.Env, OutputBaseEnv+"="+outputBase)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		// New user namespace lets an unprivileged user create the PID and
 		// mount namespaces below; map our uid/gid to root inside.
@@ -65,14 +82,25 @@ func Run(ctx context.Context, argv []string) error {
 		}},
 		GidMappingsEnableSetgroups: false,
 	}
-	// The child runs an init that already translated bazel's status into its
-	// own exit code; surface that as a bazel.ExitError so main mirrors it.
-	err = cmd.Run()
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return &bazel.ExitError{Code: ee.ExitCode(), Err: err}
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return fmt.Errorf("nsrun: start: %w", err)
 	}
-	return err
+	// Close our copy of the write end so the read below sees EOF if init dies
+	// without reporting.
+	pw.Close()
+	// Release the child so the Go runtime does not wait/reap it: init persists.
+	_ = cmd.Process.Release()
+
+	var buf [1]byte
+	n, _ := pr.Read(buf[:])
+	if n == 0 {
+		return fmt.Errorf("nsrun: init exited before reporting status")
+	}
+	if code := int(buf[0]); code != 0 {
+		return &bazel.ExitError{Code: code}
+	}
+	return nil
 }
 
 // Child is the entry point of the re-executed process. It runs as PID 1 of the

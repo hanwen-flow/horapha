@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/engflow/horapha/internal/bazel"
@@ -48,12 +49,24 @@ func run(args []string) int {
 	case "restore":
 		return toExit(checkpoint.Restore(ctx, args[1:]))
 	default:
-		// Everything else is forwarded verbatim to bazel. When HORAPHA_NS is
-		// set we run bazel inside a fresh PID namespace (experimental) so the
-		// server tree has reproducible PIDs for rootless CRIU.
+		// Everything else is forwarded to bazel. We always inject the
+		// checkpointable startup flags (and JNI env), on EVERY invocation, not
+		// just the one that starts the server: bazel refuses to attach to a
+		// running server whose startup options differ from the client's. If
+		// only the server-launching call carried these flags, ordinary
+		// `horapha build`/`info` clients would mismatch and force a restart.
+		// See internal/serverinfo and the JniLoader patch in the bazel tree.
+		ob, _ := bazel.ExplicitOutputBase(bazel.StartupFlags(args))
+		if ob != "" {
+			os.Setenv(bazel.JNIDirEnv, filepath.Join(ob, "horapha-jni"))
+		}
+		args = bazel.WithCheckpointableFlags(args)
+
+		// When HORAPHA_NS is set we run bazel inside a fresh PID namespace under
+		// an init, so the server tree has reproducible PIDs for rootless CRIU.
 		if os.Getenv("HORAPHA_NS") != "" {
 			argv := append([]string{bazel.Binary()}, args...)
-			return toExit(nsrun.Run(ctx, argv))
+			return toExit(nsrun.Run(ctx, ob, argv))
 		}
 		return toExit(bazel.Passthrough(ctx, args))
 	}

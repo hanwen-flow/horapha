@@ -31,76 +31,87 @@ or to ship a pre-warmed cache.
 
 ## How it works
 
-### Locating the server
+### Running the server in a namespace (`HORAPHA_NS=1`)
 
-`checkpoint`/`restore` accept the same bazel *startup* flags as a normal
-invocation (the flags before the bazel command, e.g. `--output_base`,
-`--output_user_root`). Those flags determine which server you talk to.
+Setting `HORAPHA_NS=1` makes `horapha` re-execute itself into fresh **user + PID
++ mount** namespaces (no root, no setuid helpers) and become **PID 1 running a
+small init** (`internal/nsrun/init.go`), which then forks bazel. The init:
 
-`horapha` runs `bazel <startup flags> info output_base` to resolve the path, then
-reads the server pid from `$output_base/server/server.pid.txt`.
+1. mounts a private `/proc` so tools and CRIU see the namespaced process view;
+2. forks bazel as the foreground command, forwards signals, and reaps orphans —
+   bazel *daemonizes* its server, which reparents to PID 1;
+3. reports the foreground command's exit code back to the launching `horapha`
+   over a pipe, then **keeps running detached**, holding the namespace (and the
+   warm server) open for a later checkpoint;
+4. serves a small checkpoint **control socket** at `$output_base/horapha.sock`.
+
+The PID namespace gives the server a stable, low namespace-local pid that CRIU
+re-creates exactly on restore. The network namespace is **shared with the host**
+so an ordinary `bazel` client can still reach the server's gRPC port over
+loopback (see below).
 
 ### Checkpoint / restore
 
-Images are written under `$output_base/criu/`. CRIU is invoked with
-`--unprivileged` (rootless), `--tree`/`--tree-aware` to capture the whole server
-tree, `--tcp-established` to preserve the gRPC command port, and
-`--restore-detached` on restore so the revived tree outlives `horapha`.
+`checkpoint`/`restore` take the same bazel *startup* flags as a normal
+invocation; `--output_base` is **required** (we must not run `bazel info`, which
+would start a competing server). Images live under `$output_base/criu/`.
 
-### PID namespace + init (experimental)
+CRIU needs `CAP_CHECKPOINT_RESTORE`, which is only held *inside* the user
+namespace — and an unprivileged host process cannot re-enter a PID namespace
+(`setns(CLONE_NEWPID)` is `EPERM`; `nsenter -U` is `EINVAL`). So **CRIU runs
+inside the namespace, driven by the init**:
 
-Rootless CRIU is happiest when it owns the namespaces of the tree it dumps, and
-reproducible PIDs make restore reliable. Setting `HORAPHA_NS=1` makes `horapha`
-re-execute itself into fresh **user + PID + mount** namespaces (no root, no
-setuid helpers).
+- `horapha checkpoint` connects to the control socket and asks the init to run
+  `criu dump --leave-running`. The checkpointed namespace-local pid is recorded
+  in `criu/ns-pid`.
+- `horapha restore` launches `criu restore` as the foreground command of a fresh
+  namespace; the init adopts the restored server and persists.
 
-Inside the namespace, the re-exec'd `horapha` becomes **PID 1 and runs a small
-init** (`internal/nsrun/init.go`) rather than exec'ing bazel directly. The init:
+CRIU is run with `--unprivileged`, `--tcp-close` (clients reconnect),
+`--ghost-limit`, and `--skip-file-rwx-check`. We keep the **host network
+namespace** rather than isolating it, so the restored server's gRPC port stays
+reachable from host clients; `--unprivileged` makes CRIU treat the resulting
+privileged-net operations as non-fatal.
 
-1. mounts a private `/proc` so tools and CRIU see the namespaced process view;
-2. forks bazel as a child in its own process group;
-3. forwards SIGINT/SIGTERM/SIGHUP/SIGQUIT to it;
-4. reaps orphans — bazel *daemonizes* its server, which reparents to PID 1, so
-   init must wait on it rather than leave a zombie;
-5. propagates the primary child's exit status as its own.
+### How a host client reattaches to the namespaced server
 
-Exec'ing bazel directly as PID 1 (the previous approach) was wrong: the bazel
-*client* would be PID 1, and when it exited the namespace — and the server —
-would be torn down. The init decouples the server's lifetime from the client.
+The bazel client decides whether to attach by reading
+`$output_base/server/server_info.rawproto` **from disk** (not over the wire) and
+verifying the `pid` field against the host `/proc` plus `server.starttime`. A
+server in a PID namespace records its *namespace-local* pid there, which a host
+client would resolve to the wrong process. So horapha rewrites the `pid` field of
+`server_info.rawproto` to the server's **host** pid (and, on restore, refreshes
+`server.starttime`). It deliberately leaves `server.pid.txt` alone, because the
+server's `PidFileWatcher` hard-exits if that file stops matching its own
+namespace-local pid. See `internal/serverinfo`.
 
-#### Why a *persistent* init is required for server reuse
+### Required bazel patch
 
-The current `HORAPHA_NS` is **per-invocation** (model A): each build gets a fresh
-namespace, and after the primary client exits the init SIGTERMs any lingering
-daemons and exits too. That is enough to exercise checkpoint of a single build,
-but it does not give you a warm server reused across builds.
-
-A discovered kernel constraint shapes the next step: **an unprivileged process
-cannot `setns()` into an existing PID namespace**, even after entering the
-owning user namespace and becoming euid 0 (verified on this host —
-`setns(CLONE_NEWPID)` returns `EPERM`). So you cannot create a warm server in a
-namespace and later `nsenter` a new client into it without privilege.
-
-The persistent design (model B, not yet built) is therefore: a long-lived init
-daemon owns the namespace and the warm bazel server, and clients reach it over a
-**unix socket**; the daemon forks each `bazel` command as *its own* child inside
-the namespace. Checkpoint/restore then snapshot that daemon's tree.
+The bazel server extracts its JNI libraries (`libunix_jni.so`, and Netty's
+native lib) to `/tmp` and **unlinks them while keeping them mapped**. Rootless
+CRIU cannot dump such deleted mappings (reading `/proc/PID/map_files/<addr>`
+needs `CAP_SYS_ADMIN` in the *initial* user namespace, which a rootless userns
+never has). horapha therefore needs a small patch to bazel's `JniLoader`
+(honouring `HORAPHA_JNI_DIR`: extract to a stable dir and skip the unlink), and
+sets `-Dio.netty.native.deleteLibAfterLoading=false` for Netty. With both, the
+libraries stay file-backed and CRIU dumps them normally.
 
 ## Requirements
 
 - Linux with unprivileged user namespaces enabled
   (`sysctl kernel.unprivileged_userns_clone=1` on some distros).
 - `criu` >= 3.18 on `$PATH` (4.x recommended for `--unprivileged`).
-- `bazel` or `bazelisk` on `$PATH`.
+- A bazel built with the `JniLoader` patch above (point `HORAPHA_BAZEL` at it).
 
 ## Configuration
 
-| Env var          | Effect                                        |
-|------------------|-----------------------------------------------|
-| `HORAPHA_BAZEL`  | bazel binary to wrap (default: bazelisk/bazel)|
-| `HORAPHA_CRIU`   | criu binary to use (default: `criu`)          |
-| `HORAPHA_NS`     | run bazel inside a PID namespace (experimental)|
-| `HORAPHA_DEBUG`  | mirror CRIU logs to stderr                    |
+| Env var           | Effect                                                 |
+|-------------------|--------------------------------------------------------|
+| `HORAPHA_BAZEL`   | bazel binary to wrap (default: bazelisk/bazel)         |
+| `HORAPHA_CRIU`    | criu binary to use (default: `criu`)                   |
+| `HORAPHA_NS`      | run bazel under an init in user+PID+mount namespaces   |
+| `HORAPHA_JNI_DIR` | set automatically: where the patched bazel keeps JNI libs |
+| `HORAPHA_DEBUG`   | mirror CRIU logs to stderr                             |
 
 ## Build
 
@@ -110,6 +121,8 @@ go build -o horapha .
 
 ## Status
 
-This is a research experiment. Expect rough edges, especially around server
-persistence inside namespaces and CRIU restoring open file descriptors into the
-output tree.
+This is a research experiment. The full cycle works end-to-end: a warm server
+started with `HORAPHA_NS=1` can be checkpointed, the machine state thrown away,
+restored, and a stock bazel client reattaches to the revived server. Rough edges
+remain (a client must pass the same startup flags horapha injects; multi-server
+and cleanup edge cases are not hardened).
