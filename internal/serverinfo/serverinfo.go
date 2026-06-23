@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Files within $output_base/server.
@@ -73,6 +74,26 @@ func RewriteForHostPID(outputBase string, hostPID int) error {
 		return fmt.Errorf("write %s: %w", StartTimeName, err)
 	}
 	return nil
+}
+
+// MakeReachable points a host-side bazel client at a server that lives in a PID
+// namespace. nsPID is the server's namespace-local pid (as found in
+// server.pid.txt); this resolves the server's host pid and rewrites
+// server_info.rawproto + server.starttime to it.
+//
+// It waits up to timeout for a process named wantComm (e.g. "java") to appear
+// under nsPID, because the server may still be settling — at normal startup the
+// daemon has just forked, and after a restore the tree is reparented
+// asynchronously.
+func MakeReachable(nsPID int, wantComm, outputBase string, timeout time.Duration) (int, error) {
+	hostPID, err := WaitHostPIDForNSPID(nsPID, wantComm, timeout)
+	if err != nil {
+		return 0, err
+	}
+	if err := RewriteForHostPID(outputBase, hostPID); err != nil {
+		return 0, fmt.Errorf("rewrite server identity for host pid %d: %w", hostPID, err)
+	}
+	return hostPID, nil
 }
 
 // PatchRawprotoPID rewrites field 1 (pid, a varint) of the ServerInfo proto at

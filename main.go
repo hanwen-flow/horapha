@@ -19,10 +19,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/engflow/horapha/internal/bazel"
 	"github.com/engflow/horapha/internal/checkpoint"
 	"github.com/engflow/horapha/internal/nsrun"
+	"github.com/engflow/horapha/internal/serverinfo"
 )
 
 func main() {
@@ -66,7 +68,17 @@ func run(args []string) int {
 		// an init, so the server tree has reproducible PIDs for rootless CRIU.
 		if os.Getenv("HORAPHA_NS") != "" {
 			argv := append([]string{bazel.Binary()}, args...)
-			return toExit(nsrun.Run(ctx, ob, argv))
+			err := nsrun.Run(ctx, ob, argv)
+			// The server now runs in the namespace and has written its
+			// server_info.rawproto advertising its *namespace-local* pid, which
+			// a host client cannot verify. Rewrite it to the host pid so plain
+			// host clients can attach over loopback — without this they would
+			// fail verification and start a competing server. Best-effort: a
+			// failure here only costs the transparent-reattach optimization.
+			if ob != "" {
+				makeServerReachable(ob)
+			}
+			return toExit(err)
 		}
 		return toExit(bazel.Passthrough(ctx, args))
 	}
@@ -77,6 +89,20 @@ func firstArg(args []string) string {
 		return ""
 	}
 	return args[0]
+}
+
+// makeServerReachable rewrites the namespaced server's identity files so a
+// host-side bazel client can attach to it. Best-effort; errors are reported but
+// not fatal (the build itself already succeeded).
+func makeServerReachable(outputBase string) {
+	nsPID, err := bazel.ServerPID(outputBase)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "horapha: could not read server pid: %v\n", err)
+		return
+	}
+	if _, err := serverinfo.MakeReachable(nsPID, "java", outputBase, 10*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "horapha: could not make server reachable: %v\n", err)
+	}
 }
 
 // toExit maps an error to a process exit code, preserving bazel's own exit

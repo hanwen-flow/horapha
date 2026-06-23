@@ -102,12 +102,9 @@ func Restore(ctx context.Context, startupArgs []string) error {
 	// client's validation files at it. The restored tree is reparented
 	// asynchronously, so wait for the java server (not a criu transient) to
 	// appear under the checkpointed namespace pid.
-	hostPID, err := serverinfo.WaitHostPIDForNSPID(nsPID, "java", 30*time.Second)
+	hostPID, err := serverinfo.MakeReachable(nsPID, "java", outputBase, 30*time.Second)
 	if err != nil {
-		return fmt.Errorf("locate restored server (ns pid %d): %w", nsPID, err)
-	}
-	if err := serverinfo.RewriteForHostPID(outputBase, hostPID); err != nil {
-		return fmt.Errorf("rewrite server identity for host pid %d: %w", hostPID, err)
+		return fmt.Errorf("make restored server reachable (ns pid %d): %w", nsPID, err)
 	}
 	fmt.Fprintf(os.Stderr, "horapha: restored; server reachable at host pid %d\n", hostPID)
 	return nil
