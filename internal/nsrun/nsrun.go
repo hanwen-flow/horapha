@@ -65,8 +65,13 @@ func Run(ctx context.Context, outputBase string, argv []string) error {
 		cmd.Env = append(cmd.Env, OutputBaseEnv+"="+outputBase)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		// New user namespace lets an unprivileged user create the PID and
-		// mount namespaces below; map our uid/gid to root inside.
+		// New user namespace lets an unprivileged user create the PID and mount
+		// namespaces below; map our uid/gid to root inside so we hold the
+		// capabilities needed to mount /proc and run criu (an identity mapping
+		// yields an empty capability set). Running as uid 0 makes getpwuid()
+		// resolve "~" to /root, which would break tilde paths in the server
+		// (e.g. a disk cache under $HOME); WithCheckpointableFlags passes
+		// -Duser.home=$HOME to the server JVM to compensate.
 		Cloneflags: syscall.CLONE_NEWUSER |
 			syscall.CLONE_NEWPID |
 			syscall.CLONE_NEWNS,

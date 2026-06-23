@@ -60,13 +60,35 @@ const JNIDirEnv = "HORAPHA_JNI_DIR"
 const nettyNoDeleteFlag = "--host_jvm_args=-Dio.netty.native.deleteLibAfterLoading=false"
 
 // WithCheckpointableFlags inserts the bazel startup flags required to make the
-// server checkpointable, ahead of the user's arguments, unless already present.
-// Startup flags must precede the bazel command, so they go at the front.
+// server checkpointable, ahead of the user's arguments. Startup flags must
+// precede the bazel command, so they go at the front. Each flag is added only
+// if an equivalent is not already present.
 func WithCheckpointableFlags(args []string) []string {
-	if slices.Contains(args, nettyNoDeleteFlag) {
-		return args // already present
+	// The server runs as uid 0 inside the user namespace, so the JVM's
+	// user.home would otherwise resolve to /root via getpwuid; pin it to the
+	// real home so bazel expands "~" (e.g. in a disk cache path) correctly.
+	userHomeFlag := "--host_jvm_args=-Duser.home=" + homeDir()
+
+	var prepend []string
+	if !slices.Contains(args, nettyNoDeleteFlag) {
+		prepend = append(prepend, nettyNoDeleteFlag)
 	}
-	return append([]string{nettyNoDeleteFlag}, args...)
+	if !hasHostJVMArg(args, "-Duser.home=") {
+		prepend = append(prepend, userHomeFlag)
+	}
+	return append(prepend, args...)
+}
+
+// hasHostJVMArg reports whether args already contains a --host_jvm_args flag
+// carrying the given JVM property prefix (so we do not override a user's
+// explicit value).
+func hasHostJVMArg(args []string, jvmPrefix string) bool {
+	for _, a := range args {
+		if v, ok := strings.CutPrefix(a, "--host_jvm_args="); ok && strings.HasPrefix(v, jvmPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // StartupFlags extracts the bazel *startup* flags from a horapha argument list.
