@@ -32,11 +32,11 @@ func run(args []string) int {
 	// nsrun re-executes this binary inside a fresh PID/user namespace using a
 	// hidden first argument. Handle that before anything else.
 	if len(args) > 0 && args[0] == nsrun.ChildArg {
-		if err := nsrun.Child(args[1:]); err != nil {
+		code, err := nsrun.Child(args[1:])
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "horapha: child: %v\n", err)
-			return 1
 		}
-		return 0
+		return code
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

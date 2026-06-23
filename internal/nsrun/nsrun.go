@@ -5,17 +5,25 @@
 // Rootless CRIU needs the checkpointed tree to live in a user namespace it
 // owns, and a PID namespace makes the captured PIDs reproducible on restore.
 // We achieve both by re-executing horapha itself with a sentinel first
-// argument: the parent sets up the namespaces via SysProcAttr, and the
-// re-executed child (Child) mounts a private /proc and then execs the real
-// command.
+// argument: the parent (Run) sets up the namespaces via SysProcAttr, and the
+// re-executed child (Child) becomes PID 1 and runs a small init that forks the
+// real command, reaps orphans, and forwards signals (see init.go).
+//
+// Why an init at all? Bazel daemonizes its server, which then reparents to
+// PID 1 of the namespace. If we exec'd bazel directly as PID 1, the client
+// exiting would tear down the namespace and kill the server. A proper init
+// lets the server's lifetime be managed independently of the client.
 package nsrun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
+
+	"github.com/engflow/horapha/internal/bazel"
 )
 
 // ChildArg is the sentinel first argument that marks a re-exec into the
@@ -57,30 +65,27 @@ func Run(ctx context.Context, argv []string) error {
 		}},
 		GidMappingsEnableSetgroups: false,
 	}
-	return cmd.Run()
+	// The child runs an init that already translated bazel's status into its
+	// own exit code; surface that as a bazel.ExitError so main mirrors it.
+	err = cmd.Run()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return &bazel.ExitError{Code: ee.ExitCode(), Err: err}
+	}
+	return err
 }
 
 // Child is the entry point of the re-executed process. It runs as PID 1 of the
-// new PID namespace, mounts a private /proc so that tools (and CRIU) see the
-// namespaced view, then execs the real command argv[0] argv[1:].
-func Child(argv []string) error {
+// new PID namespace and hands off to the init loop, which mounts a private
+// /proc, forks argv[0] argv[1:], reaps orphans, and forwards signals. The
+// returned int is the exit code to use for the process.
+func Child(argv []string) (int, error) {
 	if len(argv) == 0 {
-		return fmt.Errorf("nsrun child: empty argv")
+		return 1, fmt.Errorf("nsrun child: empty argv")
 	}
+	return runInit(argv)
+}
 
-	// Make mount changes private to this namespace, then mount a fresh /proc.
-	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
-		return fmt.Errorf("nsrun child: make-rprivate: %w", err)
-	}
-	if err := syscall.Mount("proc", "/proc", "proc",
-		syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""); err != nil {
-		return fmt.Errorf("nsrun child: mount /proc: %w", err)
-	}
-
-	bin, err := exec.LookPath(argv[0])
-	if err != nil {
-		return fmt.Errorf("nsrun child: lookup %q: %w", argv[0], err)
-	}
-	// Replace ourselves with the target so it becomes PID 1 of the namespace.
-	return syscall.Exec(bin, argv, os.Environ())
+func lookPath(name string) (string, error) {
+	return exec.LookPath(name)
 }
