@@ -6,6 +6,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"github.com/engflow/horapha/internal/criu"
 )
 
 // OutputBaseEnv carries output_base from Run into the re-exec'd init, so the
@@ -36,11 +39,23 @@ const statusFD = 3
 // returns to the shell, which is what makes a later `horapha checkpoint`
 // possible. The namespace persists exactly as long as this init does.
 //
-// All child management uses raw ForkExec/Wait4 (not os/exec) so the Go runtime
-// SIGCHLD reaper does not race us on wait4(-1, ...).
-func runInit(argv []string) (exitCode int, err error) {
-	if err := mountProc(); err != nil {
-		return 1, err
+// This loop owns all child waits, including commands launched by the control
+// server; those commands receive their exit status through commandWaiters.
+func runInit(argv []string, restoreReexec bool) (exitCode int, err error) {
+	if os.Getpid() != 1 || os.Getuid() == 0 {
+		return 1, fmt.Errorf("init: requires non-root PID 1 in a new owned namespace")
+	}
+	if !restoreReexec {
+		if err := mountProc(); err != nil {
+			return 1, err
+		}
+	}
+	if criu.Operation(argv) == "restore" {
+		if err := prepareRestorePIDSpace(argv, restoreReexec); err != nil {
+			return 1, err
+		}
+	} else if restoreReexec {
+		return 1, fmt.Errorf("init: restore re-exec requires the configured CRIU restore command")
 	}
 
 	bin, err := lookPath(argv[0])
@@ -52,15 +67,17 @@ func runInit(argv []string) (exitCode int, err error) {
 	ctlCtx, ctlCancel := context.WithCancel(context.Background())
 	defer ctlCancel()
 	ob := os.Getenv(OutputBaseEnv)
+	commands := commandWaiters{outputBase: ob, pending: make(map[int]commandWaiter)}
 	logControl(ob, "init entry: output_base=%q pid=%d", ob, os.Getpid())
 	if ob != "" {
-		go serveControl(ctlCtx, ob)
+		go serveControl(ctlCtx, ob, &commands)
 	}
 
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh,
 		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 
+	primaryStarted := time.Now()
 	primary, err := syscall.ForkExec(bin, argv, &syscall.ProcAttr{
 		Env:   os.Environ(),
 		Files: []uintptr{0, 1, 2},
@@ -86,7 +103,8 @@ func runInit(argv []string) (exitCode int, err error) {
 	reported := false
 	for {
 		var ws syscall.WaitStatus
-		wpid, werr := syscall.Wait4(-1, &ws, 0, nil)
+		var usage syscall.Rusage
+		wpid, werr := syscall.Wait4(-1, &ws, 0, &usage)
 		if werr == syscall.EINTR {
 			continue
 		}
@@ -96,8 +114,12 @@ func runInit(argv []string) (exitCode int, err error) {
 		if werr != nil {
 			return 1, fmt.Errorf("init: wait4: %w", werr)
 		}
+		commands.reaped(wpid, ws, usage)
 		if wpid == primary && !reported {
 			primaryCode = waitStatusToCode(ws)
+			if operation := criu.Operation(argv); operation != "" {
+				logControl(ob, "%s", criu.Usage(operation, wpid, primaryCode, time.Since(primaryStarted), usage))
+			}
 			reportStatus(primaryCode)
 			reported = true
 			// Detach from the controlling terminal's stdio so the parent's

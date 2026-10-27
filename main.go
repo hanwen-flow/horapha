@@ -33,6 +33,9 @@ func main() {
 }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == nsrun.OuterChildArg {
+		return toExit(nsrun.OuterChild(args[1:]))
+	}
 	// nsrun re-executes this binary inside a fresh PID/user namespace using a
 	// hidden first argument. Handle that before anything else.
 	if len(args) > 0 && args[0] == nsrun.ChildArg {
@@ -47,6 +50,8 @@ func run(args []string) int {
 	defer stop()
 
 	switch firstArg(args) {
+	case "namespace":
+		return toExit(nsrun.OuterRun(ctx, args[1:]))
 	case "checkpoint":
 		return toExit(checkpoint.Checkpoint(ctx, args[1:]))
 	case "restore":
@@ -75,7 +80,7 @@ func run(args []string) int {
 		// the user transparently reattaches to their saved server instead of
 		// cold-starting a new one. Best-effort — on failure we fall through to
 		// a normal (cold) bazel invocation.
-		if ob != "" && !namespacedServerRunning(ob) && checkpoint.Exists(ob) {
+		if ob != "" && !namespacedServerRunning(ctx, ob) && checkpoint.Exists(ob) {
 			fmt.Fprintf(os.Stderr, "horapha: no server running; restoring checkpoint\n")
 			if err := checkpoint.Restore(ctx, []string{"--output_base=" + ob}); err != nil {
 				fmt.Fprintf(os.Stderr, "horapha: auto-restore failed (%v); starting fresh\n", err)
@@ -94,16 +99,16 @@ func run(args []string) int {
 		// client, which attaches over loopback via the rewritten rawproto;
 		// re-entering would otherwise spawn a fresh namespace each time (its
 		// client cannot see the existing server's host pid in its own /proc).
-		if os.Getenv("HORAPHA_NO_NS") == "" && ob != "" && !namespacedServerRunning(ob) {
+		if os.Getenv("HORAPHA_NO_NS") == "" && ob != "" && !namespacedServerRunning(ctx, ob) {
 			argv := append([]string{bazel.Binary()}, args...)
-			err := nsrun.Run(ctx, ob, argv)
+			err := nsrun.Run(ctx, ob, argv, nil)
 			// The server now runs in the namespace and has written its
 			// server_info.rawproto advertising its *namespace-local* pid, which
 			// a host client cannot verify. Rewrite it to the host pid so plain
 			// host clients can attach over loopback — without this they would
 			// fail verification and start a competing server. Best-effort: a
 			// failure here only costs the transparent-reattach optimization.
-			makeServerReachable(ob)
+			makeServerReachable(ctx, ob)
 			return toExit(err)
 		}
 		return toExit(bazel.Passthrough(ctx, args))
@@ -120,24 +125,34 @@ func firstArg(args []string) string {
 // namespacedServerRunning reports whether an in-namespace init is already
 // serving the checkpoint control socket for this output_base, i.e. a warm
 // namespaced server already exists and we should attach rather than start one.
-func namespacedServerRunning(outputBase string) bool {
+func namespacedServerRunning(ctx context.Context, outputBase string) bool {
 	if outputBase == "" {
 		return false
 	}
-	resp, err := control.Request(outputBase, control.CmdPing, 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	resp, err := control.Request(ctx, outputBase, control.CmdPing)
 	return err == nil && resp.OK
 }
 
 // makeServerReachable rewrites the namespaced server's identity files so a
 // host-side bazel client can attach to it. Best-effort; errors are reported but
 // not fatal (the build itself already succeeded).
-func makeServerReachable(outputBase string) {
+func makeServerReachable(ctx context.Context, outputBase string) {
+	if ctx.Err() != nil {
+		return
+	}
 	nsPID, err := bazel.ServerPID(outputBase)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "horapha: could not read server pid: %v\n", err)
 		return
 	}
-	if _, err := serverinfo.MakeReachable(nsPID, "java", outputBase, 10*time.Second); err != nil {
+	initPID, err := control.PeerPID(outputBase)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "horapha: could not find namespace init: %v\n", err)
+		return
+	}
+	if _, err := serverinfo.MakeReachable(ctx, initPID, nsPID, "java", outputBase, 10*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "horapha: could not make server reachable: %v\n", err)
 	}
 }

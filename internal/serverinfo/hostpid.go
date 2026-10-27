@@ -2,6 +2,7 @@ package serverinfo
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,11 +15,17 @@ import (
 // This is used after `criu restore --restore-detached`, where the restored tree
 // is reparented asynchronously and a transient (criu itself, a forking helper)
 // may briefly hold the namespace pid before the real server settles.
-func WaitHostPIDForNSPID(nsPID int, wantComm string, timeout time.Duration) (int, error) {
-	deadline := time.Now().Add(timeout)
+func WaitHostPIDForNSPID(ctx context.Context, nsPID int, namespace os.FileInfo, wantComm string, timeout time.Duration) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 	var lastErr error
 	for {
-		hostPID, err := HostPIDForNSPID(nsPID)
+		if err := ctx.Err(); err != nil {
+			return 0, fmt.Errorf("waiting for restored server (ns pid %d): %w (last lookup: %v)", nsPID, err, lastErr)
+		}
+		hostPID, err := HostPIDForNSPID(nsPID, namespace)
 		if err == nil {
 			if wantComm == "" || comm(hostPID) == wantComm {
 				return hostPID, nil
@@ -28,10 +35,10 @@ func WaitHostPIDForNSPID(nsPID int, wantComm string, timeout time.Duration) (int
 		} else {
 			lastErr = err
 		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("waiting for restored server (ns pid %d): %w", nsPID, lastErr)
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -44,13 +51,12 @@ func comm(pid int) string {
 }
 
 // HostPIDForNSPID scans /proc and returns the host pid of the process whose
-// innermost namespace pid equals nsPID. This is how horapha, running on the
-// host, locates a server living inside a PID namespace.
+// innermost namespace pid equals nsPID in the specified PID namespace.
 //
 // The NSpid line in /proc/<host>/status lists a process's pid in each pid
 // namespace from outermost (host) to innermost; the last field is the pid as
 // seen inside its own namespace.
-func HostPIDForNSPID(nsPID int) (int, error) {
+func HostPIDForNSPID(nsPID int, namespace os.FileInfo) (int, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, err
@@ -60,21 +66,22 @@ func HostPIDForNSPID(nsPID int) (int, error) {
 		if err != nil {
 			continue // not a pid dir
 		}
+		candidate, err := os.Stat(fmt.Sprintf("/proc/%d/ns/pid", hostPID))
+		if err != nil || !os.SameFile(namespace, candidate) {
+			continue
+		}
 		inner, ok := innerNSPID(hostPID)
 		if !ok {
 			continue
 		}
-		if inner == nsPID && hostPID != nsPID {
-			// hostPID != nsPID guards against matching the process in its own
-			// (host) namespace where the two are trivially equal.
+		if inner == nsPID {
 			return hostPID, nil
 		}
 	}
 	return 0, fmt.Errorf("no host process maps to namespace pid %d", nsPID)
 }
 
-// innerNSPID returns the innermost-namespace pid for a host pid, and whether
-// the process is actually in a nested pid namespace (NSpid has >1 field).
+// innerNSPID returns the innermost-namespace pid for a host pid.
 func innerNSPID(hostPID int) (int, bool) {
 	f, err := os.Open(fmt.Sprintf("/proc/%d/status", hostPID))
 	if err != nil {
@@ -90,8 +97,8 @@ func innerNSPID(hostPID int) (int, bool) {
 			continue
 		}
 		fields := strings.Fields(rest)
-		if len(fields) < 2 {
-			return 0, false // not in a nested namespace
+		if len(fields) == 0 {
+			return 0, false
 		}
 		inner, err := strconv.Atoi(fields[len(fields)-1])
 		if err != nil {

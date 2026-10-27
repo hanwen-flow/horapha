@@ -59,19 +59,25 @@ const JNIDirEnv = "HORAPHA_JNI_DIR"
 // JNIDirEnv. It is a bazel startup flag (affects the server JVM).
 const nettyNoDeleteFlag = "--host_jvm_args=-Dio.netty.native.deleteLibAfterLoading=false"
 
+// Keep perf counters in anonymous memory: shared /tmp/hsperfdata files use
+// namespace PIDs and can disappear between restores when other JVMs clean up.
+const perfPrivateMemoryFlag = "--host_jvm_args=-XX:+PerfDisableSharedMem"
+
 // WithCheckpointableFlags inserts the bazel startup flags required to make the
 // server checkpointable, ahead of the user's arguments. Startup flags must
 // precede the bazel command, so they go at the front. Each flag is added only
 // if an equivalent is not already present.
 func WithCheckpointableFlags(args []string) []string {
-	// The server runs as uid 0 inside the user namespace, so the JVM's
-	// user.home would otherwise resolve to /root via getpwuid; pin it to the
-	// real home so bazel expands "~" (e.g. in a disk cache path) correctly.
+	// Keep "~" expansion consistent with the host client's HOME, including
+	// callers that override their passwd entry's home directory.
 	userHomeFlag := "--host_jvm_args=-Duser.home=" + homeDir()
 
 	var prepend []string
 	if !slices.Contains(args, nettyNoDeleteFlag) {
 		prepend = append(prepend, nettyNoDeleteFlag)
+	}
+	if !slices.Contains(args, perfPrivateMemoryFlag) {
+		prepend = append(prepend, perfPrivateMemoryFlag)
 	}
 	if !hasHostJVMArg(args, "-Duser.home=") {
 		prepend = append(prepend, userHomeFlag)

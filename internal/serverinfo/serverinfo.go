@@ -28,6 +28,7 @@
 package serverinfo
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,7 +78,7 @@ func RewriteForHostPID(outputBase string, hostPID int) error {
 }
 
 // MakeReachable points a host-side bazel client at a server that lives in a PID
-// namespace. nsPID is the server's namespace-local pid (as found in
+// namespace owned by initPID. nsPID is the server's namespace-local pid (as found in
 // server.pid.txt); this resolves the server's host pid and rewrites
 // server_info.rawproto + server.starttime to it.
 //
@@ -85,9 +86,25 @@ func RewriteForHostPID(outputBase string, hostPID int) error {
 // under nsPID, because the server may still be settling — at normal startup the
 // daemon has just forked, and after a restore the tree is reparented
 // asynchronously.
-func MakeReachable(nsPID int, wantComm, outputBase string, timeout time.Duration) (int, error) {
-	hostPID, err := WaitHostPIDForNSPID(nsPID, wantComm, timeout)
+func MakeReachable(ctx context.Context, initPID, nsPID int, wantComm, outputBase string, timeout time.Duration) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	// Keep the namespace alive during lookup so its inode cannot be reused.
+	ns, err := os.Open(fmt.Sprintf("/proc/%d/ns/pid", initPID))
 	if err != nil {
+		return 0, fmt.Errorf("open control peer's PID namespace: %w", err)
+	}
+	defer ns.Close()
+	namespace, err := ns.Stat()
+	if err != nil {
+		return 0, err
+	}
+	hostPID, err := WaitHostPIDForNSPID(ctx, nsPID, namespace, wantComm, timeout)
+	if err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	if err := RewriteForHostPID(outputBase, hostPID); err != nil {

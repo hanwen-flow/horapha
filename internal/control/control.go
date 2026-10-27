@@ -17,11 +17,12 @@ package control
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
-	"time"
+	"syscall"
 )
 
 // SockName is the control socket, relative to output_base.
@@ -33,14 +34,42 @@ const (
 	CmdPing = "PING"
 	// CmdCheckpoint dumps the server and leaves it running.
 	CmdCheckpoint = "CHECKPOINT"
-	// CmdCheckpointStop dumps the server and then stops it (criu kills the
-	// dumped tree), so the namespace and its init tear down afterwards.
+	// CmdCheckpointStop attempts a dump, then tears down the owned namespace
+	// even if capture fails. A failed attempt is not a usable checkpoint.
 	CmdCheckpointStop = "CHECKPOINT_STOP"
 )
 
 // SockPath returns the control socket path for an output_base.
 func SockPath(outputBase string) string {
 	return filepath.Join(outputBase, SockName)
+}
+
+// PeerPID returns the init's PID as seen by the caller, using credentials
+// supplied by the kernel rather than a namespace-local PID in the protocol.
+func PeerPID(outputBase string) (int, error) {
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: SockPath(outputBase), Net: "unix"})
+	if err != nil {
+		return 0, fmt.Errorf("dial control socket: %w", err)
+	}
+	defer conn.Close()
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var cred *syscall.Ucred
+	var credErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, credErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+	}); err != nil {
+		return 0, err
+	}
+	if credErr != nil {
+		return 0, fmt.Errorf("read control peer credentials: %w", credErr)
+	}
+	if cred.Pid <= 0 {
+		return 0, fmt.Errorf("control peer has no visible PID")
+	}
+	return int(cred.Pid), nil
 }
 
 // Response is the parsed reply from the init.
@@ -50,23 +79,27 @@ type Response struct {
 }
 
 // Request dials the control socket, sends one command line, and returns the
-// parsed response. A zero timeout means no deadline.
-func Request(outputBase, cmd string, timeout time.Duration) (Response, error) {
-	conn, err := net.Dial("unix", SockPath(outputBase))
+// parsed response. The caller controls its deadline and cancellation.
+func Request(ctx context.Context, outputBase, cmd string) (Response, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", SockPath(outputBase))
 	if err != nil {
 		return Response{}, fmt.Errorf("dial control socket (is the namespaced server running?): %w", err)
 	}
 	defer conn.Close()
-
-	if timeout > 0 {
-		_ = conn.SetDeadline(time.Now().Add(timeout))
-	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 
 	if _, err := fmt.Fprintf(conn, "%s\n", cmd); err != nil {
+		if ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
 		return Response{}, err
 	}
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
+		if ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
 		return Response{}, fmt.Errorf("read control response: %w", err)
 	}
 	return parseResponse(line), nil

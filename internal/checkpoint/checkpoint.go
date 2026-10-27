@@ -40,8 +40,8 @@ func Exists(outputBase string) bool {
 // held there and the host cannot re-enter the namespace; the init is our agent
 // inside it. See internal/control.
 func Checkpoint(ctx context.Context, args []string) error {
-	// --stop is a horapha flag (not bazel's): after dumping, stop the server
-	// and tear down its namespace. Strip it before resolving startup flags.
+	// --stop tears down the namespace after the capture attempt, even on error.
+	// Strip this horapha flag before resolving bazel startup flags.
 	stop, args := popFlag(args, "--stop")
 
 	startup := bazel.StartupFlags(args)
@@ -64,7 +64,7 @@ func Checkpoint(ctx context.Context, args []string) error {
 	dir := filepath.Join(outputBase, imagesSubdir)
 	fmt.Fprintf(os.Stderr, "horapha: requesting %s -> %s\n", action, dir)
 
-	resp, err := control.Request(outputBase, cmd, 5*time.Minute)
+	resp, err := control.Request(ctx, outputBase, cmd)
 	if err != nil {
 		return err
 	}
@@ -120,17 +120,15 @@ func Restore(ctx context.Context, startupArgs []string) error {
 	// serving the control socket — exactly as if the server had been launched
 	// with HORAPHA_NS=1.
 	restoreArgv := criu.RestoreArgs(options(dir))
-	if err := nsrun.Run(ctx, outputBase, restoreArgv); err != nil {
-		return fmt.Errorf("criu restore in namespace: %w", err)
-	}
-
-	// The restored server has a new host pid and a new start time. Point the
-	// client's validation files at it. The restored tree is reparented
-	// asynchronously, so wait for the java server (not a criu transient) to
-	// appear under the checkpointed namespace pid.
-	hostPID, err := serverinfo.MakeReachable(nsPID, "java", outputBase, 30*time.Second)
-	if err != nil {
-		return fmt.Errorf("make restored server reachable (ns pid %d): %w", nsPID, err)
+	var hostPID int
+	if err := nsrun.Run(ctx, outputBase, restoreArgv, func(initPID int) error {
+		// Retain the owned init until the restored JVM's new host identity is
+		// published, so reconnection failures also tear down this namespace.
+		var err error
+		hostPID, err = serverinfo.MakeReachable(ctx, initPID, nsPID, "java", outputBase, 30*time.Second)
+		return err
+	}); err != nil {
+		return fmt.Errorf("restore in namespace: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "horapha: restored; server reachable at host pid %d\n", hostPID)
 	return nil

@@ -1,18 +1,12 @@
 // Package criu is a thin wrapper around the criu(8) command line.
 //
-// criu dump/restore require CAP_CHECKPOINT_RESTORE. In horapha that capability
-// is only held *inside* the user namespace the server lives in (an unprivileged
-// host process does not have it and cannot re-enter the namespace). Therefore
-// criu is always invoked from within the namespace by the init process, where
-// we are effectively root over our own userns — so --unprivileged is usually
-// unnecessary and left off by default.
+// The init invokes CRIU inside the server's user namespace. Its capabilities
+// apply only there; --unprivileged handles operations on shared host resources
+// such as networking, where those capabilities confer no privilege.
 package criu
 
 import (
-	"context"
-	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 )
 
@@ -35,11 +29,10 @@ type Options struct {
 	// restore them. The bazel server's clients are transient and reconnect, so
 	// we close rather than preserve the gRPC command-port connections.
 	TCPClose bool
-	// LeaveRunning leaves the dumped tree running after a successful dump
-	// (otherwise criu kills it). Only meaningful for Dump.
+	// LeaveRunning resumes the dumped tree after a successful dump;
+	// otherwise it stays stopped. Only meaningful for Dump.
 	LeaveRunning bool
-	// Unprivileged relaxes criu's checks for rootless operation. Only needed
-	// when criu lacks full capabilities; left off when run inside our userns.
+	// Unprivileged relaxes CRIU's checks for rootless operation on shared resources.
 	Unprivileged bool
 	// LogToStderr mirrors criu logs to stderr.
 	LogToStderr bool
@@ -50,6 +43,9 @@ type Options struct {
 func (o Options) common() []string {
 	args := []string{
 		"--images-dir", o.ImagesDir,
+		// Bazel holds persistent locks. The runner must exclusively own its
+		// output and install directories across checkpoint and restore.
+		"--file-locks",
 		// Raise the ghost-file size limit so any large deleted-but-mapped files
 		// criu does copy into the image are not rejected.
 		"--ghost-limit", "1000000000",
@@ -83,17 +79,17 @@ func (o Options) common() []string {
 	return append(args, o.Extra...)
 }
 
-// Dump checkpoints the process tree rooted at pid into opts.ImagesDir.
-func Dump(ctx context.Context, pid int, opts Options) error {
-	if err := os.MkdirAll(opts.ImagesDir, 0o755); err != nil {
-		return err
-	}
+// DumpArgs returns the full criu argv for a dump. The namespace init owns
+// child reaping, so it must launch this command and collect its exit status.
+func DumpArgs(pid int, opts Options) []string {
 	args := []string{"dump", "--tree", strconv.Itoa(pid)}
 	if opts.LeaveRunning {
 		args = append(args, "--leave-running")
+	} else {
+		args = append(args, "--leave-stopped")
 	}
 	args = append(args, opts.common()...)
-	return runCRIU(ctx, args)
+	return append([]string{Binary()}, args...)
 }
 
 // RestoreArgs returns the full criu argv (including the binary) for a restore.
@@ -102,15 +98,4 @@ func Dump(ctx context.Context, pid int, opts Options) error {
 // the argv rather than running criu directly here.
 func RestoreArgs(opts Options) []string {
 	return append([]string{Binary(), "restore", "--restore-detached"}, opts.common()...)
-}
-
-func runCRIU(ctx context.Context, args []string) error {
-	cmd := exec.CommandContext(ctx, Binary(), args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("criu %s: %w", args[0], err)
-	}
-	return nil
 }
